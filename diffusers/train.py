@@ -28,6 +28,7 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 from utils import (
     CustomDiffusionDataset,
+    CustomRetainDataset,
     PromptDataset,
     collate_fn,
     filter,
@@ -953,6 +954,13 @@ def main(args):
         aug=not args.noaug,
     )
 
+    # Dataset and DataLoaders creation:
+    train_dataset = CustomRetainDataset(
+        size=args.resolution,
+        center_crop=args.center_crop,
+        hflip=args.hflip,
+        aug=not args.noaug,
+    )
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
@@ -1150,7 +1158,7 @@ def main(args):
                         model_pred.float(), target.float(), reduction="none"
                     )
                     loss = ((loss * mask).sum([1, 2, 3]) / mask.sum([1, 2, 3])).mean()
-
+                
                 accelerator.backward(loss)
                 # Zero out the gradients for all token embeddings except the newly added
                 # embeddings for the concept, as we only want to optimize the concept embeddings

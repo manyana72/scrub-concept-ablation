@@ -342,6 +342,96 @@ class CustomDiffusionDataset(Dataset):
 
         return example
 
+class CustomRetainDataset(Dataset):
+    """
+    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
+    It pre-processes the images and the tokenizes prompts.
+    """
+
+    def __init__(
+        self,
+        path,
+        size=512,
+        center_crop=False,
+        hflip=False,
+        aug=True,
+    ):
+        self.size = size
+        self.center_crop = center_crop
+        self.interpolation = Image.BILINEAR
+        self.aug = aug
+
+        self.instance_images_path = [os.path.join(path, x) for x in os.listdir(path)]
+
+        random.shuffle(self.instance_images_path)
+        self.num_instance_images = len(self.instance_images_path)
+        self._length = len(self.instance_images_path)
+        self.flip = transforms.RandomHorizontalFlip(0.5 * hflip)
+
+        self.image_transforms = transforms.Compose(
+            [
+                self.flip,
+                transforms.Resize(
+                    size, interpolation=transforms.InterpolationMode.BILINEAR
+                ),
+                transforms.CenterCrop(size)
+                if center_crop
+                else transforms.RandomCrop(size),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
+
+    def __len__(self):
+        return self._length
+
+    def preprocess(self, image, scale, resample):
+        outer, inner = self.size, scale
+        if scale > self.size:
+            outer, inner = scale, self.size
+        top, left = np.random.randint(0, outer - inner + 1), np.random.randint(
+            0, outer - inner + 1
+        )
+        image = image.resize((scale, scale), resample=resample)
+        image = np.array(image).astype(np.uint8)
+        image = (image / 127.5 - 1.0).astype(np.float32)
+        instance_image = np.zeros((self.size, self.size, 3), dtype=np.float32)
+        mask = np.zeros((self.size // 8, self.size // 8))
+        if scale > self.size:
+            instance_image = image[top : top + inner, left : left + inner, :]
+            mask = np.ones((self.size // 8, self.size // 8))
+        else:
+            instance_image[top : top + inner, left : left + inner, :] = image
+            mask[
+                top // 8 + 1 : (top + scale) // 8 - 1,
+                left // 8 + 1 : (left + scale) // 8 - 1,
+            ] = 1.0
+        return instance_image, mask
+
+    def __getitem__(self, index):
+        example = {}
+        instance_image = self.instance_images_path[index % self.num_instance_images]
+        instance_image = Image.open(instance_image)
+        if not instance_image.mode == "RGB":
+            instance_image = instance_image.convert("RGB")
+        instance_image = self.flip(instance_image)
+
+        # apply resize augmentation and create a valid image region mask
+        random_scale = self.size
+        if self.aug:
+            random_scale = (
+                np.random.randint(self.size // 3, self.size + 1)
+                if np.random.uniform() < 0.66
+                else np.random.randint(int(1.2 * self.size), int(1.4 * self.size))
+            )
+        instance_image, mask = self.preprocess(
+            instance_image, random_scale, self.interpolation
+        )
+
+        example["instance_images"] = torch.from_numpy(instance_image).permute(2, 0, 1)
+        example["mask"] = torch.from_numpy(mask)
+
+        return example
 
 def isimage(path):
     if "png" in path.lower() or "jpg" in path.lower() or "jpeg" in path.lower():

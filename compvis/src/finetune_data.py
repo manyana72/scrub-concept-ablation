@@ -132,6 +132,7 @@ def get_styled_prompt(caption_target, caption):
 class MaskBase(Dataset):
     def __init__(self,
                  datapath,
+                 retain_path=None,
                  reg_datapath=None,
                  caption=None,
                  reg_caption=None,
@@ -141,13 +142,15 @@ class MaskBase(Dataset):
                  aug=True,
                  style=False,
                  caption_target=None,
-                 repeat=0.
+                 repeat=0.,
                  ):
 
         self.aug = aug
         self.repeat = repeat
         self.style = style
         self.caption_target = caption_target
+        self.retain_path = retain_path
+
         # multiple style/object fine-tuning
         if self.caption_target is not None and ';' in self.caption_target:
             self.caption_target_list = self.caption_target.split(';')
@@ -155,6 +158,11 @@ class MaskBase(Dataset):
         self.templates_small = templates_small
         if self.style:
             self.templates_small = templates_small_style
+
+        if self.retain_path:
+            self.retain_paths = [os.path.join(retain_path, file_path) for file_path in os.listdir(retain_path) if isimage(file_path)]
+            self.retain_length = len(self.retain_paths)
+
         if os.path.isdir(datapath):
             self.image_paths1 = [os.path.join(datapath, file_path)
                                  for file_path in os.listdir(datapath) if isimage(file_path)]
@@ -188,6 +196,7 @@ class MaskBase(Dataset):
         self.labels = {
             "relative_file_path1_": [x for x in self.image_paths1],
             "relative_file_path2_": [x for x in self.image_paths2],
+            "retain_path": [x for x in self.retain_paths],
         }
 
         self.size = size
@@ -223,9 +232,13 @@ class MaskBase(Dataset):
                 self.caption_target = self.caption_target_list[(i % min(self._length1, len(self.caption))) // 1000]
 
         example = {}
+        if self.retain_path is not None:
+            retain_image = Image.open(self.labels["retain_path"][i % self.retain_length])
 
         if i >= self._length2 or self._length2 == 0:
-            image = Image.open(self.labels["relative_file_path1_"][i % self._length1])
+            forget_image = Image.open(self.labels["relative_file_path1_"][i % self._length1])
+
+
             if isinstance(self.caption, str):
                 example["caption"] = np.random.choice(self.templates_small).format(self.caption)
             else:
@@ -242,82 +255,197 @@ class MaskBase(Dataset):
                     else:
                         example["caption"] = example["caption_target"].strip().lower().replace(general, target)
         else:
-            image = Image.open(self.labels["relative_file_path2_"][i % self._length2])
+            forget_image = Image.open(self.labels["relative_file_path2_"][i % self._length2])
             if isinstance(self.reg_caption, str):
                 example["caption"] = np.random.choice(self.templates_small).format(self.reg_caption)
             else:
                 example["caption"] = self.reg_caption[i % self._length2]
 
-        if not image.mode == "RGB":
-            image = image.convert("RGB")
+        if self.retain_path is not None:
+            image_targets = [(forget_image, "forget"), (retain_image, "retain")]
+        else:
+            image_targets = [(forget_image, "forget")]
+        
+        for image, target in image_targets:
+            if not image.mode == "RGB":
+                image = image.convert("RGB")
 
-        # default to score-sde preprocessing
-        img = np.array(image).astype(np.uint8)
-        crop = min(img.shape[0], img.shape[1])
-        h, w, = img.shape[0], img.shape[1]
+            # default to score-sde preprocessing
+            img = np.array(image).astype(np.uint8)
+            crop = min(img.shape[0], img.shape[1])
+            h, w, = img.shape[0], img.shape[1]
 
-        img = img[(h - crop) // 2:(h + crop) // 2,
-                  (w - crop) // 2:(w + crop) // 2]
+            img = img[(h - crop) // 2:(h + crop) // 2,
+                    (w - crop) // 2:(w + crop) // 2]
 
-        image = Image.fromarray(img)
-        image = self.flip(image)
+            image = Image.fromarray(img)
+            image = self.flip(image)
 
-        if i > self._length2 or self._length2 == 0:
-            if self.aug:
-                if np.random.randint(0, 3) < 2:
-                    random_scale = np.random.randint(self.size // 3, self.size+1)
+            if i > self._length2 or self._length2 == 0:
+                if self.aug:
+                    if np.random.randint(0, 3) < 2:
+                        random_scale = np.random.randint(self.size // 3, self.size+1)
+                    else:
+                        random_scale = np.random.randint(int(1.2*self.size), int(1.4*self.size))
+
+                    if random_scale % 2 == 1:
+                        random_scale += 1
                 else:
-                    random_scale = np.random.randint(int(1.2*self.size), int(1.4*self.size))
+                    random_scale = self.size
 
-                if random_scale % 2 == 1:
-                    random_scale += 1
-            else:
-                random_scale = self.size
+                if random_scale < 0.6*self.size:
+                    if target == "forget":
+                        add_to_caption = np.random.choice(["a far away ", "very small "])
+                        example["caption"] = add_to_caption + example["caption"]
+                    cx = np.random.randint(random_scale // 2, self.size - random_scale // 2 + 1)
+                    cy = np.random.randint(random_scale // 2, self.size - random_scale // 2 + 1)
 
-            if random_scale < 0.6*self.size:
-                add_to_caption = np.random.choice(["a far away ", "very small "])
-                example["caption"] = add_to_caption + example["caption"]
-                cx = np.random.randint(random_scale // 2, self.size - random_scale // 2 + 1)
-                cy = np.random.randint(random_scale // 2, self.size - random_scale // 2 + 1)
+                    image = image.resize((random_scale, random_scale), resample=self.interpolation)
+                    image = np.array(image).astype(np.uint8)
+                    image = (image / 127.5 - 1.0).astype(np.float32)
 
-                image = image.resize((random_scale, random_scale), resample=self.interpolation)
-                image = np.array(image).astype(np.uint8)
-                image = (image / 127.5 - 1.0).astype(np.float32)
+                    input_image1 = np.zeros((self.size, self.size, 3), dtype=np.float32)
+                    input_image1[cx - random_scale // 2: cx + random_scale // 2,
+                                cy - random_scale // 2: cy + random_scale // 2, :] = image
 
-                input_image1 = np.zeros((self.size, self.size, 3), dtype=np.float32)
-                input_image1[cx - random_scale // 2: cx + random_scale // 2,
-                             cy - random_scale // 2: cy + random_scale // 2, :] = image
+                    mask = np.zeros((self.size // 8, self.size // 8))
+                    mask[(cx - random_scale // 2) // 8 + 1: (cx + random_scale // 2) // 8 - 1,
+                        (cy - random_scale // 2) // 8 + 1: (cy + random_scale // 2) // 8 - 1] = 1.
 
-                mask = np.zeros((self.size // 8, self.size // 8))
-                mask[(cx - random_scale // 2) // 8 + 1: (cx + random_scale // 2) // 8 - 1,
-                     (cy - random_scale // 2) // 8 + 1: (cy + random_scale // 2) // 8 - 1] = 1.
+                elif random_scale > self.size:
+                    if target == "forget":
+                        add_to_caption = np.random.choice(["zoomed in ", "close up "])
+                        example["caption"] = add_to_caption + example["caption"]
+                    cx = np.random.randint(self.size // 2, random_scale - self.size // 2 + 1)
+                    cy = np.random.randint(self.size // 2, random_scale - self.size // 2 + 1)
 
-            elif random_scale > self.size:
-                add_to_caption = np.random.choice(["zoomed in ", "close up "])
-                example["caption"] = add_to_caption + example["caption"]
-                cx = np.random.randint(self.size // 2, random_scale - self.size // 2 + 1)
-                cy = np.random.randint(self.size // 2, random_scale - self.size // 2 + 1)
-
-                image = image.resize((random_scale, random_scale), resample=self.interpolation)
-                image = np.array(image).astype(np.uint8)
-                image = (image / 127.5 - 1.0).astype(np.float32)
-                input_image1 = image[cx - self.size // 2: cx + self.size //
-                                     2, cy - self.size // 2: cy + self.size // 2, :]
-                mask = np.ones((self.size // 8, self.size // 8))
+                    image = image.resize((random_scale, random_scale), resample=self.interpolation)
+                    image = np.array(image).astype(np.uint8)
+                    image = (image / 127.5 - 1.0).astype(np.float32)
+                    input_image1 = image[cx - self.size // 2: cx + self.size //
+                                        2, cy - self.size // 2: cy + self.size // 2, :]
+                    mask = np.ones((self.size // 8, self.size // 8))
+                else:
+                    if self.size is not None:
+                        image = image.resize((self.size, self.size), resample=self.interpolation)
+                    input_image1 = np.array(image).astype(np.uint8)
+                    input_image1 = (input_image1 / 127.5 - 1.0).astype(np.float32)
+                    mask = np.ones((self.size // 8, self.size // 8))
             else:
                 if self.size is not None:
                     image = image.resize((self.size, self.size), resample=self.interpolation)
                 input_image1 = np.array(image).astype(np.uint8)
                 input_image1 = (input_image1 / 127.5 - 1.0).astype(np.float32)
                 mask = np.ones((self.size // 8, self.size // 8))
-        else:
-            if self.size is not None:
-                image = image.resize((self.size, self.size), resample=self.interpolation)
-            input_image1 = np.array(image).astype(np.uint8)
-            input_image1 = (input_image1 / 127.5 - 1.0).astype(np.float32)
-            mask = np.ones((self.size // 8, self.size // 8))
 
-        example["image"] = input_image1
-        example["mask"] = mask
-
+            if target == "forget":
+                example["image"] = input_image1
+                example["mask"] = mask
+            elif target == "retain":
+                example["retain_image"] = input_image1
+                example["retain_mask"] = mask
         return example
+
+# class RetainMaskBase(Dataset):
+#     def __init__(self,
+#                  datapath,
+#                  caption=None,
+#                  size=512,
+#                  interpolation="bicubic",
+#                  flip_p=0.5,
+#                  aug=True,
+#                  repeat=0.
+#                  ):
+
+#         self.aug = aug
+#         self.repeat = repeat
+#         # multiple style/object fine-tuning
+
+#         if os.path.isdir(datapath):
+#             self.image_paths1 = [os.path.join(datapath, file_path)
+#                                  for file_path in os.listdir(datapath) if isimage(file_path)]
+            
+#         self._length1 = len(self.image_paths1)
+
+#         self.labels = {
+#             "relative_file_path1_": [x for x in self.image_paths1],
+#         }
+
+#         self.size = size
+#         self.interpolation = {"linear": PIL.Image.LINEAR,
+#                               "bilinear": PIL.Image.BILINEAR,
+#                               "bicubic": PIL.Image.BICUBIC,
+#                               "lanczos": PIL.Image.LANCZOS,
+#                               }[interpolation]
+        
+#         self.flip = transforms.RandomHorizontalFlip(p=flip_p)
+#         self.caption = caption
+
+#     def __len__(self):
+#         if self.repeat > 0:
+#             return self._length1*self.repeat
+#         else:
+#             return self._length1
+
+#     def __getitem__(self, i):
+
+#         example = {}
+
+#         image = Image.open(self.labels["relative_file_path1_"][i % self._length1])
+
+#         if not image.mode == "RGB":
+#             image = image.convert("RGB")
+
+#         # default to score-sde preprocessing
+#         img = np.array(image).astype(np.uint8)
+#         crop = min(img.shape[0], img.shape[1])
+#         h, w, = img.shape[0], img.shape[1]
+
+#         img = img[(h - crop) // 2:(h + crop) // 2,
+#                   (w - crop) // 2:(w + crop) // 2]
+
+#         image = Image.fromarray(img)
+#         image = self.flip(image)
+
+#         if self.aug:
+#             if np.random.randint(0, 3) < 2:
+#                 random_scale = np.random.randint(self.size // 3, self.size+1)
+#             else:
+#                 random_scale = np.random.randint(int(1.2*self.size), int(1.4*self.size))
+
+#             if random_scale % 2 == 1:
+#                 random_scale += 1
+#         else:
+#             random_scale = self.size
+
+#         if random_scale < 0.6*self.size:
+#             cx = np.random.randint(random_scale // 2, self.size - random_scale // 2 + 1)
+#             cy = np.random.randint(random_scale // 2, self.size - random_scale // 2 + 1)
+
+#             image = image.resize((random_scale, random_scale), resample=self.interpolation)
+#             image = np.array(image).astype(np.uint8)
+#             image = (image / 127.5 - 1.0).astype(np.float32)
+
+#             input_image1 = np.zeros((self.size, self.size, 3), dtype=np.float32)
+#             input_image1[cx - random_scale // 2: cx + random_scale // 2,
+#                             cy - random_scale // 2: cy + random_scale // 2, :] = image
+
+#             mask = np.zeros((self.size // 8, self.size // 8))
+#             mask[(cx - random_scale // 2) // 8 + 1: (cx + random_scale // 2) // 8 - 1,
+#                 (cy - random_scale // 2) // 8 + 1: (cy + random_scale // 2) // 8 - 1] = 1.
+
+#         elif random_scale > self.size:
+#             cx = np.random.randint(self.size // 2, random_scale - self.size // 2 + 1)
+#             cy = np.random.randint(self.size // 2, random_scale - self.size // 2 + 1)
+
+#             image = image.resize((random_scale, random_scale), resample=self.interpolation)
+#             image = np.array(image).astype(np.uint8)
+#             image = (image / 127.5 - 1.0).astype(np.float32)
+#             input_image1 = image[cx - self.size // 2: cx + self.size //
+#                                     2, cy - self.size // 2: cy + self.size // 2, :]
+#             mask = np.ones((self.size // 8, self.size // 8))
+
+#         example["image"] = input_image1
+#         example["mask"] = mask
+
+#         return example

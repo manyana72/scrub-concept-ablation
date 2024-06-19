@@ -1,2 +1,7 @@
 **/.DS_Store
 .DS_Store
+./compvis/retain_set
+./compvis/log_testing
+./compvis/metrics
+./compvis/imagenet
+./assets/baseline_generation

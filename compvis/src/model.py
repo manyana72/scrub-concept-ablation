@@ -240,7 +240,7 @@ class CustomDiffusion(LatentDiffusion):
                 c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
         return self.p_losses(x, c, t, *args, **kwargs)
 
-    def p_losses(self, x_start, cond, t, mask=None, c_target=None, c_null=None, noise=None):
+    def p_losses(self, x_start, cond, t, x_retain=None,  mask=None, c_target=None, c_null=None, noise=None, mask_retain=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         model_output = self.apply_model(x_noisy, t, cond)
@@ -264,8 +264,29 @@ class CustomDiffusion(LatentDiffusion):
             loss_simple = (loss_simple*mask).sum([1, 2, 3])/mask.sum([1, 2, 3])
         else:
             loss_simple = loss_simple.mean([1, 2, 3])
-
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
+
+        gamma = 0.5  # fractional weightage to retain loss
+        if x_retain is not None:
+            noise_retain = default(noise, lambda: torch.randn_like(x_retain))
+
+            x_retain_noisy = self.q_sample(x_start=x_retain, t=t, noise=noise_retain)
+
+            model_output_retain = self.apply_model(x_retain_noisy, t, c_null)
+
+            if self.parameterization == "x0":
+                target_retain = x_retain
+            elif self.parameterization == "eps":
+                target_retain = noise_retain
+
+            loss_retain = self.get_loss(model_output_retain, target_retain, mean=False)
+            if mask is not None:
+                loss_retain = (loss_retain*mask_retain).sum([1, 2, 3])/mask.sum([1, 2, 3])
+
+        #     print("loss_retain",loss_retain)
+        #     loss_simple += gamma * loss_retain
+
+        # print("loss_simple",loss_simple)
 
         logvar_t = (self.logvar.to(self.device))[t]
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
@@ -305,6 +326,21 @@ class CustomDiffusion(LatentDiffusion):
                 else:
                     c = self.get_learned_conditioning(xc.to(self.device))
             out += [c]
+            
+        if "retain_image" in batch:
+            batch["caption"] = [""]*len(batch["caption"])  # override hack to avoid caption conditioning, acceptable since batch is never used again even outside func
+            out += super().get_input(batch, "retain_image", **args)
+
+            mask = batch["retain_mask"]
+            if len(mask.shape) == 3:
+                mask = mask[..., None]
+            mask = rearrange(mask, 'b h w c -> b c h w')
+            mask = mask.to(memory_format=torch.contiguous_format).float()
+            out += [mask]
+
+        else:
+            out += [None, None, None]
+
         return out
 
     def training_step(self, batch, batch_idx):
@@ -361,11 +397,11 @@ class CustomDiffusion(LatentDiffusion):
 
     def shared_step(self, batch, **kwargs):
         if 'model-based' in self.loss_type_reverse and 'caption_target' in batch:
-            x, c, mask, c_target = self.get_input_withmask(batch, **kwargs)
-            loss = self(x, c, mask=mask, c_target=c_target)
+            x, c, mask, c_target, x_retain, c_null, mask_retain = self.get_input_withmask(batch, **kwargs)
+            loss = self(x, c, mask=mask, c_target=c_target, x_retain=x_retain, c_null=c_null, mask_retain=mask_retain)
         else:
-            x, c, mask = self.get_input_withmask(batch, **kwargs)
-            loss = self(x, c, mask=mask)
+            x, c, mask,           x_retain, c_null, mask_retain = self.get_input_withmask(batch, **kwargs)
+            loss = self(x, c, mask=mask, x_retain=x_retain, c_null=c_null, mask_retain=mask_retain)
         return loss
 
     @rank_zero_only
